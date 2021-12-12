@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+import argparse
+import numpy as np
+import configparser
+from nanocut import *
+
+VERSION = "12.12"
+HOMEURL = "http://aradi.bitbucket.org/nanocut"
+
+BODYOBJECTS = {
+    "0D": {
+           "sphere": sphere.Sphere,
+           "polyhedron": polyhedron.Polyhedron,
+           "cylinder": cylinder.Cylinder,
+           },
+    "1D": {
+           "periodic_1D_cylinder": periodic_1D_cylinder.Periodic1DCylinder,
+           "periodic_1D_prism": periodic_1D_prism.Periodic1DPrism,
+           },
+    "2D": {
+           "periodic_2D_plane": periodic_2D_plane.Periodic2DPlane,
+           },
+    "3D": { 
+           "periodic_3D_supercell": periodic_3D_supercell.Periodic3DSupercell
+           }
+    }
+
+
+def parse_args():
+    """Builds parser and returns parsed command line.
+    
+    Returns:
+        Parsed command line as Namespace object.
+    """
+    parser = argparse.ArgumentParser(
+        description="Cuts out various 0D, 1D and 2D shapes from crystals.",
+        epilog="See {:s} for detailed documentation.".format(HOMEURL))
+    parser.add_argument(
+        "-a", "--append", action="store_true", default=False,
+        help="appends created structure to output file (instead of overwriting "
+        "it)")
+    parser.add_argument(
+        "-v", "--verbosity", default=1, type=int,
+        help="Set verbosity level: 0 - no output, 1 - normal output (default)")
+    parser.add_argument(
+        "-o", "--orthogonal-latvecs", type=float, metavar="VECLEN",
+        default=None, dest="oveclen",
+        help="add orthogonal lattice vectors of given size to make a 3D "
+        "supercell")
+    parser.add_argument(
+        "-g", "--gen-format", action="store_true", default=False, dest="gen",
+        help="creates result file in GEN format (instead of XYZ)")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("inifile", help="initialization file")
+    parser.add_argument(
+        "result",
+        help="file to write the resulting structure in xyz/gen format into")
+    parser.add_argument(
+        "latvecs", nargs="?",
+        help="extra file to store lattice vectors")
+
+    return parser.parse_args()
+
+
+def process_arguments(args):
+    """Process any command line argument which needs attention at start.
+    
+    Args:
+       args: Command line arguments (Namespace object).
+    """
+    output.set_verbosity(args.verbosity)
+
+
+def read_inifile(filename):
+    """Reads configuration file and returns it as nested dictionary.
+    
+    Args:
+        filename: Name of the file with the configuration.
+    """
+    ini = configparser.ConfigParser()
+    try:
+        configfile = open(filename, "r")
+    except IOError:
+        output.error("Can't open " + filename + ".")
+    try:
+        ini.readfp(configfile)
+    except configparser.Error as error:
+        output.error("Malformed ini-file:\n" + str(error))
+    configfile.close()
+    return ini
+     
+
+def getbodies(configdict, allowed_bodies, geometry, period):
+    """Initializes body object based on the input.
+    
+    Args:
+        configdict: Dictionary with configuration options.
+        allowed_bodies: Dictionary with allowed body objects.
+        geometry: Geometry object.
+        period: Periodicity object.
+        
+    Returns:
+       List of tuples with initialized body objects and flag signalizing whether
+       body is additive or not.
+    """
+    bodies = []
+    tmp = []
+    for section in configdict:
+        words = section.split(":")
+        if len(words) != 2:
+            continue
+        bodyobj = allowed_bodies.get(words[0], None)
+        if bodyobj is None:
+            output.error("Body type '" + words[0] + "' unknown or incompatible "
+                         " with periodicity")
+        additive = configdict[section].getboolean("additive", fallback=True)
+        bodies.append(
+            ( bodyobj.fromdict(geometry, period, configdict[section]),
+              additive ))
+    if not bodies:
+        output.error("No bodies specified.")
+    return bodies
+
+
+def getatomsinside(bodies, geo):
+    """Selects the atoms in the final structure.
+    
+    Args:
+        bodies: Bodies to consider and their additivity flag.
+        geo: Basic crystall geometry
+        
+    Returns:
+        Cartesian position of the atoms in the final structure.
+    """
+    output.printstatus("Determining boundaries of the lattice grid")
+    # Get boundaries of the cuboid containing all bodies
+    cuboid_boundaries = np.vstack(
+        [ body.containing_cuboid() for body, additive in bodies if additive ])
+    cuboid_boundaries = np.array([ cuboid_boundaries.min(axis=0),
+                                   cuboid_boundaries.max(axis=0)])
+
+    # Generate lattice-cuboid and all atoms in it
+    output.printstatus("Creating all lattice grid points")
+    lattice_cuboid = geo.gen_cuboid(cuboid_boundaries)
+    
+    output.printstatus("Filtering atoms inside specified bodies")
+    atoms_coords, atoms_idx = geo.gen_atoms(lattice_cuboid)
+    atoms_inside_bodies = np.zeros(len(atoms_coords), dtype=bool)
+    for body, additive in bodies:
+        tmp_atoms_inside_bodies = body.atoms_inside(atoms_coords)
+        
+        # Add or substract them respectively
+        if additive:
+            atoms_inside_bodies = atoms_inside_bodies + tmp_atoms_inside_bodies
+        else:
+            atoms_inside_bodies = (atoms_inside_bodies 
+                                   + tmp_atoms_inside_bodies
+                                   - tmp_atoms_inside_bodies)
+    # Take only atoms flagged being inside
+    return atoms_coords[atoms_inside_bodies], atoms_idx[atoms_inside_bodies]
+
+
+def extend_axis(axis, oveclen):
+    """Extend translational vectors to form 3D supercell.
+    
+    Args:
+        axis: Axis vectors or None for non-periodic structure.
+        oveclen: Length of the new lattice vectors.
+        
+    Returns:
+        Array of three supercell vectors.
+    """
+    if not len(axis):
+        axis = np.eye(3, dtype=float) * oveclen
+    elif len(axis) == 1:
+        axis = np.vstack(( np.eye(2, 3, dtype=float) * oveclen, axis ))
+    elif len(axis) == 2:
+        axis = np.vstack(( axis, np.array([ 0.0, 0.0, oveclen ])))
+    return axis
+
+
+def main():
+    """Main program."""
+ 
+    # Parse command line parameters
+    args = parse_args()
+    process_arguments(args)
+    
+    # Print header (delayed, so that it can be suppressed via cmd line option)
+    output.printheader()
+     
+    # Read initial file
+    output.printstatus("Parsing config file '{}'".format(args.inifile))
+    configdict = read_inifile(args.inifile)
+
+    # Process crystal geometry
+    if "geometry" not in configdict:
+        output.error("Section geometry missing")
+    geo = geometry.Geometry.fromdict(configdict["geometry"])
+    
+    # Process periodicity
+    if "periodicity" not in configdict:
+        configdict.add_section("periodicity")
+        configdict.set("periodicity", "period_type", "0D")
+    period = periodicity.Periodicity.fromdict(geo, configdict["periodicity"])
+    
+    # Process bodies
+    bodies = getbodies(configdict, BODYOBJECTS[period.period_type], geo, period)
+    
+    # Select atoms in the desired shape (first fold atoms into unit cell)
+    atoms_coords, atoms_idx = getatomsinside(bodies, geo)
+
+    # Fold atoms to unit cell and rotate to standard form
+    period.fold_to_unitcell(atoms_coords)
+    axis, atoms_coords = period.rotate_coordsys(atoms_coords)
+    
+    # Extend periodicity vectors if necessary
+    if args.oveclen:
+        axis = extend_axis(axis, args.oveclen)
+
+    # Write object to file
+    output.write_crystal(geo,atoms_coords, atoms_idx, axis, args.result,
+                         args.append, args.gen, args.latvecs)
+    
+    output.printstatus("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+### Local Variables:
+### mode: python
+### End:
