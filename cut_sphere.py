@@ -73,6 +73,6 @@ if __name__ == "__main__":
             for i in range(element_amount[index]):
                 writer.write(" %s %f %f %f\n" %(element_list[index],atoms[count][0],atoms[count][1],atoms[count][2]))
                 count+=1
-        writer.write("basis_coordsys: lattice\n\n")
+        writer.write("basis_coordsys: lattice\n\nshift_vector: 0.0 0.0 0.0\nshift_vector_coordsys: lattice\n\n")
         writer.write("[sphere: 1]\n\nradius: 10\n")
     
